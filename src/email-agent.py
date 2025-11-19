@@ -1,19 +1,27 @@
+import logging
 import os
+from typing import Literal, TypedDict
 
-from typing import TypedDict, Literal
-from langchain_openai import ChatOpenAI
-from langchain.messages import HumanMessage
-from langgraph.types import Command
 from dotenv import load_dotenv
+from langchain.messages import HumanMessage
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, RetryPolicy, interrupt
 
 # Global
 load_dotenv()
+logging.basicConfig(level=logging.DEBUG)
 llm = ChatOpenAI(
-    model="deepseek-v3.2",
+    model="deepseek-ai/DeepSeek-V3",
     base_url=os.getenv("LLM_API_URL") or "",
     api_key=os.getenv("LLM_API_KEY") or "",
     temperature=0,
 )
+
+
+class SearchAPIError(Exception):
+    pass
 
 
 class EmailClassification(TypedDict):
@@ -37,7 +45,7 @@ class EmailAgentState(TypedDict):
     customer_history: dict | None
 
     # Generated content
-    draft_reponse: str | None
+    draft_response: str | None
     message: list[str] | None
 
 
@@ -86,3 +94,151 @@ def classify_intent(
         goto = "draft_response"
 
     return Command(update={"classification": classification}, goto=goto)
+
+
+def search_documentation(state: EmailAgentState) -> Command[Literal["draft_response"]]:
+    """Search knowledge base for relevant information"""
+
+    classification = state.get("classification", {})
+    query = f"{classification.get('intent', '')} {classification.get('topic', '')}"
+    try:
+        # Implement your search locic here
+        # Store raw search results, not formatted text
+        search_results = [
+            "Reset password via Settings > Security > Change Password",
+            "Password must be at least 12 characters",
+            "Include uppercase, lowercase, numbers, and symbols",
+        ]
+    except SearchAPIError as e:
+        search_results = [f"Search temporarily unvailable: {str(e)}"]
+    return Command(update={"search_results": search_results}, goto="draft_response")
+
+
+def bug_tracking(state: EmailAgentState) -> Command[Literal["draft_response"]]:
+    """Craete or update bug tracking ticket"""
+    ticket_id = "BUG-12345"
+
+    return Command(
+        update={
+            "search_results": [f"Bug ticket {ticket_id} created"],
+            "current_step": "bug_tracked",
+        },
+        goto="draft_response",
+    )
+
+
+def draft_response(
+    state: EmailAgentState,
+) -> Command[Literal["human_review", "send_reply"]]:
+    """Generate response using context and route based on quality"""
+    classification = state.get("classification", {})
+    context_sections = []
+    if state.get("search_result"):
+        formatted_docs = "\n".join([f"- {doc}" for doc in state["search_result"]])
+        context_sections.append(f"Relevant documentation:\n{formatted_docs}")
+    if state.get("customer_history"):
+        context_sections.append(
+            f"Customer tier: {state['customer_history'].get('tier', 'standard')}"
+        )
+    draft_prompt = f"""
+    Draft a response to this customer email:
+    {state["email_content"]}
+
+    Email intent: {classification.get("intent", "unknown")}
+    Urgency level: {classification.get("urgency", "medium")}
+
+    {chr(10).join(context_sections)}
+
+    Guidelines:
+    - Be professional and helpful
+    - Address their specific concern
+    - Use the provided documentation when relevant
+    """
+
+    response = llm.invoke(draft_prompt)
+
+    needs_review = (
+        classification.get("urgency") in ["high", "critical"]
+        or classification.get("intent") == "complex"
+    )
+
+    goto = "human_review" if needs_review else "send_reply"
+    return Command(update={"draft_response": response.content}, goto=goto)
+
+
+def human_review(state: EmailAgentState) -> Command[Literal["send_reply", END]]:
+    """Pause for human review using interrupt and route based on decision"""
+    classification = state.get("classification", {})
+    human_decision = interrupt(
+        {
+            "email_id": state.get("email_id", ""),
+            "original_email": state.get("email_content", ""),
+            "draft_rsponse": state.get("draft_reponse", ""),
+            "urgency": classification.get("urgency"),
+            "intent": classification.get("intent"),
+            "action": "Please review and approve/edit this response",
+        }
+    )
+    if human_decision.get("approved"):
+        return Command(
+            update={
+                "draft_response": human_decision.get(
+                    "edited_response", state.get("draft_reponse", "")
+                )
+            },
+            goto="send_reply",
+        )
+    else:
+        return Command(update={}, goto=END)
+
+
+def send_reply(state: EmailAgentState) -> dict:
+    """Send the email response"""
+    print(f"Sending reply: {state['draft_response'][:100]}...")
+    return {}
+
+
+def main():
+    workflow = StateGraph(EmailAgentState)
+    workflow.add_node("read_email", read_email)
+    workflow.add_node("classify_intent", classify_intent)
+
+    workflow.add_node(
+        "search_documentation",
+        search_documentation,
+        retry_policy=RetryPolicy(max_attempts=3),
+    )
+    workflow.add_node("bug_tracking", bug_tracking)
+    workflow.add_node("draft_response", draft_response)
+    workflow.add_node("human_review", human_review)
+    workflow.add_node("send_reply", send_reply)
+
+    workflow.add_edge(START, "read_email")
+    workflow.add_edge("read_email", "classify_intent")
+    workflow.add_edge("send_reply", END)
+
+    memory = MemorySaver()
+    app = workflow.compile(checkpointer=memory)
+    initial_state = {
+        "email_content": "I was charged twice for my subscription! This is urgent!",
+        "sender_email": "customer@example.com",
+        "email_id": "email_123",
+        "messages": [],
+    }
+    config = {"configurable": {"thread_id": "customer_123"}}
+    result = app.invoke(initial_state, config)
+    print(f"Draft ready for review : {result['draft_response'][:100]}...")
+
+    human_response = Command(
+        resume={
+            "approved": True,
+            "edited_response": "We sincerely apologize for the double charge. I've initiated an immediate refund...",
+        }
+    )
+
+    final_result = app.invoke(human_response, config)
+    print(f"Email sent successfully! {final_result}")
+
+
+if __name__ == "__main__":
+    main()
